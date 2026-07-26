@@ -1,0 +1,5 @@
+{
+  "name": "FileEditBot",
+  "main": "main.py",
+  "requirements": "requirements.txt"
+}
