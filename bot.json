@@ -1,5 +1,5 @@
 {
-  "name": "FileEditBot",
+  "bb_sync_version": "1.0",
   "main": "main.py",
   "requirements": "requirements.txt"
 }
