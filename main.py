@@ -4,6 +4,7 @@ import uuid
 import asyncio
 import logging
 from datetime import datetime
+from flask import Flask, request
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -11,13 +12,14 @@ from telegram.constants import ParseMode
 from PIL import Image
 
 # ============================================
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLES (Set in Bot Business)
 # ============================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip()]
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))
+PORT = int(os.environ.get("PORT", "8080"))
 # ============================================
 
 MAX_FILE_SIZE = 20000000000
@@ -57,23 +59,42 @@ logger = logging.getLogger(__name__)
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(THUMB_DIR, exist_ok=True)
 
-# Database
+# ============================================
+# DATABASE CLASS
+# ============================================
 class Database:
     def __init__(self):
         self.user_file = "users.json"
         self.file_file = "files.json"
         self.admin_file = "admin.json"
-        self.users = self.load(self.user_file, {"users": {}, "banned": {}, "premium": {}, "daily": {}})
-        self.files = self.load(self.file_file, {"files": {}, "total": 0, "daily": {}})
-        self.admin = self.load(self.admin_file, {"logs": [], "maintenance": False, "settings": {"max_size": MAX_FILE_SIZE, "daily_free": DAILY_LIMIT_FREE, "daily_premium": DAILY_LIMIT_PREMIUM}})
+        self.users = self.load(self.user_file, {
+            "users": {}, 
+            "banned": {}, 
+            "premium": {}, 
+            "daily": {}
+        })
+        self.files = self.load(self.file_file, {
+            "files": {}, 
+            "total": 0, 
+            "daily": {}
+        })
+        self.admin = self.load(self.admin_file, {
+            "logs": [], 
+            "maintenance": False, 
+            "settings": {
+                "max_size": MAX_FILE_SIZE,
+                "daily_free": DAILY_LIMIT_FREE,
+                "daily_premium": DAILY_LIMIT_PREMIUM
+            }
+        })
     
     def load(self, path, default):
         try:
             if os.path.exists(path):
                 with open(path, 'r', encoding='utf-8') as f:
                     return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error loading {path}: {e}")
         self.save(path, default)
         return default
     
@@ -83,9 +104,9 @@ class Database:
                 basename = os.path.basename(path).replace('.json', '')
                 data = getattr(self, basename, {})
             with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-        except:
-            pass
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Error saving {path}: {e}")
     
     def save_all(self):
         self.save(self.user_file, self.users)
@@ -94,44 +115,68 @@ class Database:
 
 db = Database()
 
-# Keyboards
+# ============================================
+# IN-MEMORY STORAGE
+# ============================================
+user_thumbs = {}
+user_rename = {}
+
+# ============================================
+# KEYBOARDS
+# ============================================
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{ROCKET} Start Processing", callback_data='menu_process')],
-        [InlineKeyboardButton(f"{PENCIL} Rename File", callback_data='menu_rename'),
-         InlineKeyboardButton(f"{IMAGE} Thumbnail", callback_data='menu_thumb')],
-        [InlineKeyboardButton(f"{FOLDER} My Files", callback_data='menu_files'),
-         InlineKeyboardButton(f"{GEAR} Settings", callback_data='menu_settings')],
+        [
+            InlineKeyboardButton(f"{PENCIL} Rename File", callback_data='menu_rename'),
+            InlineKeyboardButton(f"{IMAGE} Thumbnail", callback_data='menu_thumb')
+        ],
+        [
+            InlineKeyboardButton(f"{FOLDER} My Files", callback_data='menu_files'),
+            InlineKeyboardButton(f"{GEAR} Settings", callback_data='menu_settings')
+        ],
         [InlineKeyboardButton(f"{GLOBE} Help", callback_data='menu_help')]
     ])
 
 def admin_panel_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{PEOPLE} Users", callback_data='admin_users'),
-         InlineKeyboardButton(f"{CHART} Stats", callback_data='admin_stats')],
-        [InlineKeyboardButton(f"{WARNING} Bans", callback_data='admin_bans'),
-         InlineKeyboardButton(f"{STAR} Premium", callback_data='admin_premium')],
-        [InlineKeyboardButton(f"{TRASH} Cleanup", callback_data='admin_cleanup'),
-         InlineKeyboardButton(f"{LOCK} Maintenance", callback_data='admin_maintenance')],
+        [
+            InlineKeyboardButton(f"{PEOPLE} Users", callback_data='admin_users'),
+            InlineKeyboardButton(f"{CHART} Stats", callback_data='admin_stats')
+        ],
+        [
+            InlineKeyboardButton(f"{WARNING} Bans", callback_data='admin_bans'),
+            InlineKeyboardButton(f"{STAR} Premium", callback_data='admin_premium')
+        ],
+        [
+            InlineKeyboardButton(f"{TRASH} Cleanup", callback_data='admin_cleanup'),
+            InlineKeyboardButton(f"{LOCK} Maintenance", callback_data='admin_maintenance')
+        ],
         [InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')]
     ])
 
 def file_actions_keyboard(file_uid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{ROCKET} Send Now", callback_data=f'send_{file_uid}'),
-         InlineKeyboardButton(f"{PENCIL} Rename", callback_data=f'rename_{file_uid}')],
-        [InlineKeyboardButton(f"{IMAGE} Thumbnail", callback_data=f'thumb_{file_uid}'),
-         InlineKeyboardButton(f"{TRASH} Delete", callback_data=f'delete_{file_uid}')],
+        [
+            InlineKeyboardButton(f"{ROCKET} Send Now", callback_data=f'send_{file_uid}'),
+            InlineKeyboardButton(f"{PENCIL} Rename", callback_data=f'rename_{file_uid}')
+        ],
+        [
+            InlineKeyboardButton(f"{IMAGE} Thumbnail", callback_data=f'thumb_{file_uid}'),
+            InlineKeyboardButton(f"{TRASH} Delete", callback_data=f'delete_{file_uid}')
+        ],
         [InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')]
     ])
 
-# User data storage
-user_thumbs = {}
-user_rename = {}
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+def is_admin(user_id):
+    return user_id in ADMIN_IDS or user_id == OWNER_ID
 
-# ============================================
-# FUNCTIONS
-# ============================================
+def is_owner(user_id):
+    return user_id == OWNER_ID
+
 async def log_to_channel(context, uid, file_name, new_name=None, file_size=None, action="processed"):
     try:
         user = await context.bot.get_chat(uid)
@@ -146,37 +191,50 @@ async def log_to_channel(context, uid, file_name, new_name=None, file_size=None,
             f"⏰ Time: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
             f"🤖 Bot: @FileEditBot"
         )
-        await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_text, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(
+            chat_id=LOG_CHANNEL_ID,
+            text=log_text,
+            parse_mode=ParseMode.HTML
+        )
     except Exception as e:
         logger.error(f"Log error: {e}")
 
 async def forward_to_channel(update, context):
     try:
-        user_info = f"👤 User: {update.effective_user.first_name}\n🆔 ID: <code>{update.effective_user.id}</code>"
+        user_info = (
+            f"👤 User: {update.effective_user.first_name}\n"
+            f"🆔 ID: <code>{update.effective_user.id}</code>"
+        )
         if update.message.document:
-            await context.bot.send_document(chat_id=LOG_CHANNEL_ID, document=update.message.document.file_id, caption=f"{PACKAGE} <b>New Document</b>\n\n{user_info}", parse_mode=ParseMode.HTML)
+            await context.bot.send_document(
+                chat_id=LOG_CHANNEL_ID,
+                document=update.message.document.file_id,
+                caption=f"{PACKAGE} <b>New Document</b>\n\n{user_info}",
+                parse_mode=ParseMode.HTML
+            )
         elif update.message.video:
-            await context.bot.send_video(chat_id=LOG_CHANNEL_ID, video=update.message.video.file_id, caption=f"🎬 <b>New Video</b>\n\n{user_info}", parse_mode=ParseMode.HTML)
+            await context.bot.send_video(
+                chat_id=LOG_CHANNEL_ID,
+                video=update.message.video.file_id,
+                caption=f"🎬 <b>New Video</b>\n\n{user_info}",
+                parse_mode=ParseMode.HTML
+            )
         elif update.message.audio:
-            await context.bot.send_audio(chat_id=LOG_CHANNEL_ID, audio=update.message.audio.file_id, caption=f"🎵 <b>New Audio</b>\n\n{user_info}", parse_mode=ParseMode.HTML)
+            await context.bot.send_audio(
+                chat_id=LOG_CHANNEL_ID,
+                audio=update.message.audio.file_id,
+                caption=f"🎵 <b>New Audio</b>\n\n{user_info}",
+                parse_mode=ParseMode.HTML
+            )
         elif update.message.photo:
-            await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=update.message.photo[-1].file_id, caption=f"🖼️ <b>New Photo</b>\n\n{user_info}", parse_mode=ParseMode.HTML)
+            await context.bot.send_photo(
+                chat_id=LOG_CHANNEL_ID,
+                photo=update.message.photo[-1].file_id,
+                caption=f"🖼️ <b>New Photo</b>\n\n{user_info}",
+                parse_mode=ParseMode.HTML
+            )
     except Exception as e:
         logger.error(f"Forward error: {e}")
-
-async def error_handler(update, context):
-    logger.error(f"Error: {context.error}")
-    try:
-        if update and update.effective_message:
-            await update.effective_message.reply_text(f"{CROSS} An error occurred. Please try again.")
-    except:
-        pass
-
-def is_admin(user_id):
-    return user_id in ADMIN_IDS or user_id == OWNER_ID
-
-def is_owner(user_id):
-    return user_id == OWNER_ID
 
 # ============================================
 # COMMAND HANDLERS
@@ -187,7 +245,12 @@ async def start(update, context):
         uid = str(user.id)
         
         if uid not in db.users['users']:
-            db.users['users'][uid] = {'name': user.first_name, 'username': user.username, 'joined': datetime.now().isoformat(), 'files': 0}
+            db.users['users'][uid] = {
+                'name': user.first_name,
+                'username': user.username,
+                'joined': datetime.now().isoformat(),
+                'files': 0
+            }
             db.save_all()
         
         if uid in db.users['banned']:
@@ -213,7 +276,11 @@ async def start(update, context):
             f"{FOLDER} Daily Limit: {DAILY_LIMIT_PREMIUM if is_prem else DAILY_LIMIT_FREE}\n\n"
             f"Send me a file to start!"
         )
-        await update.message.reply_text(welcome, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            welcome,
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
     except Exception as e:
         logger.error(f"Start error: {e}")
 
@@ -224,28 +291,32 @@ async def help_cmd(update, context):
         
         help_text = (
             f"{GLOBE} <b>Help Menu</b>\n\n"
-            f"<b>Commands:</b>\n"
+            f"<b>User Commands:</b>\n"
             f"/start - Main menu\n"
-            f"/help - Help\n"
-            f"/stats - Statistics\n\n"
+            f"/help - This help message\n"
+            f"/stats - Bot statistics\n\n"
             f"<b>How to use:</b>\n"
-            f"1. Send me any file\n"
+            f"1. Send me any file (document, video, audio)\n"
             f"2. Use buttons to rename or add thumbnail\n"
-            f"3. Click Send Now\n"
+            f"3. Click Send Now to get your file\n\n"
         )
         
         if admin_check:
             help_text += (
-                f"\n{CROWN} <b>Admin:</b>\n"
+                f"{CROWN} <b>Admin Commands:</b>\n"
                 f"/admin - Admin panel\n"
-                f"/ban [id] [reason]\n"
-                f"/unban [id]\n"
-                f"/broadcast [msg]\n"
-                f"/addpremium [id]\n"
-                f"/rempremium [id]\n"
+                f"/ban [id] [reason] - Ban user\n"
+                f"/unban [id] - Unban user\n"
+                f"/broadcast [msg] - Broadcast to all users\n"
+                f"/addpremium [id] - Add premium user\n"
+                f"/rempremium [id] - Remove premium user\n"
             )
         
-        await update.message.reply_text(help_text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            help_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
     except Exception as e:
         logger.error(f"Help error: {e}")
 
@@ -253,97 +324,152 @@ async def stats_cmd(update, context):
     try:
         total_users = len(db.users['users'])
         total_files = db.files['total']
-        await update.message.reply_text(f"{CHART} <b>Bot Stats</b>\n\n{PEOPLE} Users: <code>{total_users}</code>\n{PACKAGE} Files: <code>{total_files}</code>", parse_mode=ParseMode.HTML)
+        stats_text = (
+            f"{CHART} <b>Bot Stats</b>\n\n"
+            f"{PEOPLE} Users: <code>{total_users}</code>\n"
+            f"{PACKAGE} Files: <code>{total_files}</code>"
+        )
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Stats error: {e}")
 
 async def admin_cmd(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(f"{CROSS} Access Denied!")
-        return
-    await update.message.reply_text(f"{CROWN} <b>Admin Panel</b>\n\nSelect option:", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+    try:
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text(f"{CROSS} Access Denied!")
+            return
+        await update.message.reply_text(
+            f"{CROWN} <b>Admin Panel</b>\n\nSelect option:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Admin error: {e}")
 
 async def ban_cmd(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(f"{CROSS} Access Denied!")
-        return
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(f"{WARNING} Usage: /ban [user_id] [reason]")
-        return
-    target = context.args[0]
-    reason = ' '.join(context.args[1:])
-    db.users['banned'][target] = {'reason': reason, 'banned_by': update.effective_user.id, 'date': datetime.now().isoformat()}
-    db.save_all()
-    await update.message.reply_text(f"{CHECK} User banned: <code>{target}</code>", parse_mode=ParseMode.HTML)
     try:
-        await context.bot.send_message(chat_id=target, text=f"{CROSS} You have been banned!\nReason: {reason}")
-    except:
-        pass
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text(f"{CROSS} Access Denied!")
+            return
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(f"{WARNING} Usage: /ban [user_id] [reason]")
+            return
+        target = context.args[0]
+        reason = ' '.join(context.args[1:])
+        db.users['banned'][target] = {
+            'reason': reason,
+            'banned_by': update.effective_user.id,
+            'date': datetime.now().isoformat()
+        }
+        db.save_all()
+        await update.message.reply_text(
+            f"{CHECK} User banned: <code>{target}</code>",
+            parse_mode=ParseMode.HTML
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target,
+                text=f"{CROSS} You have been banned!\nReason: {reason}"
+            )
+        except:
+            pass
+    except Exception as e:
+        logger.error(f"Ban error: {e}")
 
 async def unban_cmd(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(f"{CROSS} Access Denied!")
-        return
-    if not context.args:
-        await update.message.reply_text(f"{WARNING} Usage: /unban [user_id]")
-        return
-    target = context.args[0]
-    if target in db.users['banned']:
-        del db.users['banned'][target]
-        db.save_all()
-        await update.message.reply_text(f"{CHECK} User unbanned!")
-    else:
-        await update.message.reply_text(f"{CROSS} User not banned!")
+    try:
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text(f"{CROSS} Access Denied!")
+            return
+        if not context.args:
+            await update.message.reply_text(f"{WARNING} Usage: /unban [user_id]")
+            return
+        target = context.args[0]
+        if target in db.users['banned']:
+            del db.users['banned'][target]
+            db.save_all()
+            await update.message.reply_text(f"{CHECK} User unbanned!")
+        else:
+            await update.message.reply_text(f"{CROSS} User not banned!")
+    except Exception as e:
+        logger.error(f"Unban error: {e}")
 
 async def broadcast_cmd(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(f"{CROSS} Access Denied!")
-        return
-    if not context.args:
-        await update.message.reply_text(f"{WARNING} Usage: /broadcast [message]")
-        return
-    msg_text = ' '.join(context.args)
-    status = await update.message.reply_text(f"{GEAR} Broadcasting...")
-    success, failed = 0, 0
-    for uid in list(db.users['users'].keys()):
-        try:
-            await context.bot.send_message(chat_id=uid, text=f"📢 <b>Announcement</b>\n\n{msg_text}", parse_mode=ParseMode.HTML)
-            success += 1
-        except:
-            failed += 1
-        await asyncio.sleep(0.05)
-    await status.edit_text(f"{CHECK} Broadcast complete!\n\n✅ Success: {success}\n❌ Failed: {failed}")
+    try:
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text(f"{CROSS} Access Denied!")
+            return
+        if not context.args:
+            await update.message.reply_text(f"{WARNING} Usage: /broadcast [message]")
+            return
+        msg_text = ' '.join(context.args)
+        status = await update.message.reply_text(f"{GEAR} Broadcasting...")
+        success, failed = 0, 0
+        for uid in list(db.users['users'].keys()):
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"📢 <b>Announcement</b>\n\n{msg_text}",
+                    parse_mode=ParseMode.HTML
+                )
+                success += 1
+            except:
+                failed += 1
+            await asyncio.sleep(0.05)
+        await status.edit_text(
+            f"{CHECK} Broadcast complete!\n\n✅ Success: {success}\n❌ Failed: {failed}"
+        )
+    except Exception as e:
+        logger.error(f"Broadcast error: {e}")
 
 async def addpremium_cmd(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(f"{CROSS} Access Denied!")
-        return
-    if not context.args:
-        await update.message.reply_text(f"{WARNING} Usage: /addpremium [user_id]")
-        return
-    target = context.args[0]
-    db.users['premium'][target] = {'granted_by': update.effective_user.id, 'date': datetime.now().isoformat()}
-    db.save_all()
-    await update.message.reply_text(f"{STAR} Premium granted to: <code>{target}</code>", parse_mode=ParseMode.HTML)
     try:
-        await context.bot.send_message(chat_id=target, text=f"{STAR} You have been upgraded to Premium!")
-    except:
-        pass
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text(f"{CROSS} Access Denied!")
+            return
+        if not context.args:
+            await update.message.reply_text(f"{WARNING} Usage: /addpremium [user_id]")
+            return
+        target = context.args[0]
+        db.users['premium'][target] = {
+            'granted_by': update.effective_user.id,
+            'date': datetime.now().isoformat()
+        }
+        db.save_all()
+        await update.message.reply_text(
+            f"{STAR} Premium granted to: <code>{target}</code>",
+            parse_mode=ParseMode.HTML
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target,
+                text=f"{STAR} You have been upgraded to Premium!"
+            )
+        except:
+            pass
+    except Exception as e:
+        logger.error(f"AddPremium error: {e}")
 
 async def rempremium_cmd(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(f"{CROSS} Access Denied!")
-        return
-    if not context.args:
-        await update.message.reply_text(f"{WARNING} Usage: /rempremium [user_id]")
-        return
-    target = context.args[0]
-    if target in db.users['premium']:
-        del db.users['premium'][target]
-        db.save_all()
-        await update.message.reply_text(f"{CHECK} Premium removed from: <code>{target}</code>", parse_mode=ParseMode.HTML)
-    else:
-        await update.message.reply_text(f"{CROSS} User is not premium!")
+    try:
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text(f"{CROSS} Access Denied!")
+            return
+        if not context.args:
+            await update.message.reply_text(f"{WARNING} Usage: /rempremium [user_id]")
+            return
+        target = context.args[0]
+        if target in db.users['premium']:
+            del db.users['premium'][target]
+            db.save_all()
+            await update.message.reply_text(
+                f"{CHECK} Premium removed from: <code>{target}</code>",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text(f"{CROSS} User is not premium!")
+    except Exception as e:
+        logger.error(f"RemPremium error: {e}")
 
 # ============================================
 # MESSAGE HANDLERS
@@ -404,6 +530,7 @@ async def handle_file(update, context):
             'timestamp': datetime.now().isoformat(),
             'rename_to': None
         }
+        
         db.files['total'] += 1
         if today not in db.files['daily']:
             db.files['daily'][today] = {}
@@ -422,7 +549,11 @@ async def handle_file(update, context):
             f"🆔 ID: <code>{file_uid}</code>\n\n"
             f"{SPARKLES} What to do?"
         )
-        await msg.reply_text(card, parse_mode=ParseMode.HTML, reply_markup=file_actions_keyboard(file_uid))
+        await msg.reply_text(
+            card,
+            parse_mode=ParseMode.HTML,
+            reply_markup=file_actions_keyboard(file_uid)
+        )
     except Exception as e:
         logger.error(f"Handle file error: {e}")
 
@@ -438,7 +569,10 @@ async def handle_photo(update, context):
         is_setting_file_thumb = 'awaiting_thumb_file' in context.user_data
         
         if not is_setting_thumb and not is_setting_file_thumb:
-            await update.message.reply_text(f"{IMAGE} Send me a file to process!", reply_markup=main_menu_keyboard())
+            await update.message.reply_text(
+                f"{IMAGE} Send me a file to process!",
+                reply_markup=main_menu_keyboard()
+            )
             return
         
         photo = update.message.photo[-1]
@@ -450,18 +584,24 @@ async def handle_photo(update, context):
             img = Image.open(thumb_path)
             img = img.resize((320, 320), Image.Resampling.LANCZOS)
             img.save(thumb_path, "JPEG", quality=85)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Thumbnail processing error: {e}")
         
         user_thumbs[uid] = thumb_path
         
         if is_setting_thumb:
             context.user_data.pop('awaiting_thumb', None)
-            await update.message.reply_text(f"{CHECK} Thumbnail set successfully!", reply_markup=main_menu_keyboard())
+            await update.message.reply_text(
+                f"{CHECK} Thumbnail set successfully!",
+                reply_markup=main_menu_keyboard()
+            )
         elif is_setting_file_thumb:
             file_uid = context.user_data['awaiting_thumb_file']
             del context.user_data['awaiting_thumb_file']
-            await update.message.reply_text(f"{CHECK} Thumbnail set for this file!", reply_markup=file_actions_keyboard(file_uid))
+            await update.message.reply_text(
+                f"{CHECK} Thumbnail set for this file!",
+                reply_markup=file_actions_keyboard(file_uid)
+            )
     except Exception as e:
         logger.error(f"Handle photo error: {e}")
 
@@ -476,7 +616,11 @@ async def handle_text(update, context):
         if context.user_data.get('awaiting_rename', False):
             user_rename[uid] = text
             context.user_data.pop('awaiting_rename', None)
-            await update.message.reply_text(f"{CHECK} Files will be renamed to: <code>{text}</code>", parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+            await update.message.reply_text(
+                f"{CHECK} Files will be renamed to: <code>{text}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
             return
         
         if 'awaiting_rename_file' in context.user_data:
@@ -484,11 +628,18 @@ async def handle_text(update, context):
             if file_uid in db.files['files']:
                 db.files['files'][file_uid]['rename_to'] = text
                 db.save_all()
-                await update.message.reply_text(f"{CHECK} Renamed to: <code>{text}</code>", parse_mode=ParseMode.HTML, reply_markup=file_actions_keyboard(file_uid))
+                await update.message.reply_text(
+                    f"{CHECK} Renamed to: <code>{text}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=file_actions_keyboard(file_uid)
+                )
             del context.user_data['awaiting_rename_file']
             return
         
-        await update.message.reply_text(f"{ROBOT} Use the menu below or send a file!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            f"{ROBOT} Use the menu below or send a file!",
+            reply_markup=main_menu_keyboard()
+        )
     except Exception as e:
         logger.error(f"Handle text error: {e}")
 
@@ -505,36 +656,82 @@ async def button_handler(update, context):
     
     try:
         if data == 'back_main':
-            await query.edit_message_text(f"{ROBOT} <b>Main Menu</b>\n\nSelect an option:", parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+            await query.edit_message_text(
+                f"{ROBOT} <b>Main Menu</b>\n\nSelect an option:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
         
         elif data == 'menu_process':
-            await query.edit_message_text(f"{ROCKET} <b>Send me a file!</b>\n\nSupported: Documents, Videos, Audio", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')]]))
+            await query.edit_message_text(
+                f"{ROCKET} <b>Send me a file!</b>\n\nSupported: Documents, Videos, Audio",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')
+                ]])
+            )
         
         elif data == 'menu_rename':
             context.user_data['awaiting_rename'] = True
-            await query.edit_message_text(f"{PENCIL} <b>Rename</b>\n\nSend new filename:\nExample: <code>my_video.mp4</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{CROSS} Cancel", callback_data='back_main')]]))
+            await query.edit_message_text(
+                f"{PENCIL} <b>Rename</b>\n\nSend new filename:\nExample: <code>my_video.mp4</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"{CROSS} Cancel", callback_data='back_main')
+                ]])
+            )
         
         elif data == 'menu_thumb':
             context.user_data['awaiting_thumb'] = True
-            await query.edit_message_text(f"{IMAGE} <b>Set Thumbnail</b>\n\nSend a photo to use as thumbnail.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{CROSS} Cancel", callback_data='back_main')]]))
+            await query.edit_message_text(
+                f"{IMAGE} <b>Set Thumbnail</b>\n\nSend a photo to use as thumbnail.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"{CROSS} Cancel", callback_data='back_main')
+                ]])
+            )
         
         elif data == 'menu_files':
-            user_files = [(fid, info) for fid, info in db.files['files'].items() if info['user_id'] == uid]
+            user_files = [(fid, info) for fid, info in db.files['files'].items() 
+                         if info['user_id'] == uid]
             if not user_files:
-                await query.edit_message_text(f"{FOLDER} <b>No files yet!</b>\n\nSend me a file.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')]]))
+                await query.edit_message_text(
+                    f"{FOLDER} <b>No files yet!</b>\n\nSend me a file.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')
+                    ]])
+                )
             else:
                 recent = user_files[-5:]
                 keyboard = []
                 for fid, info in recent:
                     name = info.get('rename_to') or info['file_name']
-                    keyboard.append([InlineKeyboardButton(f"📄 {name[:20]}", callback_data=f'send_{fid}'), InlineKeyboardButton(f"{TRASH}", callback_data=f'delete_{fid}')])
-                keyboard.append([InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')])
-                await query.edit_message_text(f"{FOLDER} <b>Your Files</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+                    keyboard.append([
+                        InlineKeyboardButton(f"📄 {name[:20]}", callback_data=f'send_{fid}'),
+                        InlineKeyboardButton(f"{TRASH}", callback_data=f'delete_{fid}')
+                    ])
+                keyboard.append([
+                    InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')
+                ])
+                await query.edit_message_text(
+                    f"{FOLDER} <b>Your Files</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
         
         elif data == 'menu_settings':
             has_thumb = uid in user_thumbs
             rename = user_rename.get(uid, 'Not set')
-            await query.edit_message_text(f"{GEAR} <b>Settings</b>\n\n{IMAGE} Thumbnail: {'✅ Set' if has_thumb else '❌ Not set'}\n{PENCIL} Rename: {rename}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{TRASH} Clear All", callback_data='clear_settings')], [InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')]]))
+            await query.edit_message_text(
+                f"{GEAR} <b>Settings</b>\n\n"
+                f"{IMAGE} Thumbnail: {'✅ Set' if has_thumb else '❌ Not set'}\n"
+                f"{PENCIL} Rename: {rename}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{TRASH} Clear All", callback_data='clear_settings')],
+                    [InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')]
+                ])
+            )
         
         elif data == 'clear_settings':
             user_thumbs.pop(uid, None)
@@ -542,10 +739,27 @@ async def button_handler(update, context):
             thumb_file = os.path.join(THUMB_DIR, f"thumb_{uid}.jpg")
             if os.path.exists(thumb_file):
                 os.remove(thumb_file)
-            await query.edit_message_text(f"{CHECK} Settings cleared!", reply_markup=main_menu_keyboard())
+            await query.edit_message_text(
+                f"{CHECK} Settings cleared!",
+                reply_markup=main_menu_keyboard()
+            )
         
         elif data == 'menu_help':
-            await query.edit_message_text(f"{GLOBE} <b>Help</b>\n\n1. Send me a file\n2. Use buttons to customize\n3. Click Send Now\n\n<b>Commands:</b>\n/start - Main menu\n/help - Help\n/admin - Admin panel\n/stats - Statistics", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')]]))
+            await query.edit_message_text(
+                f"{GLOBE} <b>Help</b>\n\n"
+                f"1. Send me a file\n"
+                f"2. Use buttons to customize\n"
+                f"3. Click Send Now\n\n"
+                f"<b>Commands:</b>\n"
+                f"/start - Main menu\n"
+                f"/help - Help\n"
+                f"/admin - Admin panel\n"
+                f"/stats - Statistics",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"{GLOBE} Back", callback_data='back_main')
+                ]])
+            )
         
         elif data.startswith('send_'):
             file_uid = data.replace('send_', '')
@@ -554,22 +768,40 @@ async def button_handler(update, context):
         elif data.startswith('rename_'):
             file_uid = data.replace('rename_', '')
             context.user_data['awaiting_rename_file'] = file_uid
-            await query.edit_message_text(f"{PENCIL} Send new filename:\nExample: <code>video.mp4</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{CROSS} Cancel", callback_data=f'send_{file_uid}')]]))
+            await query.edit_message_text(
+                f"{PENCIL} Send new filename:\nExample: <code>video.mp4</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"{CROSS} Cancel", callback_data=f'send_{file_uid}')
+                ]])
+            )
         
         elif data.startswith('thumb_'):
             file_uid = data.replace('thumb_', '')
             context.user_data['awaiting_thumb_file'] = file_uid
-            await query.edit_message_text(f"{IMAGE} Send a photo for thumbnail:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{CROSS} Cancel", callback_data=f'send_{file_uid}')]]))
+            await query.edit_message_text(
+                f"{IMAGE} Send a photo for thumbnail:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"{CROSS} Cancel", callback_data=f'send_{file_uid}')
+                ]])
+            )
         
         elif data.startswith('delete_'):
             file_uid = data.replace('delete_', '')
             db.files['files'].pop(file_uid, None)
             db.save_all()
-            await query.edit_message_text(f"{TRASH} File deleted!", reply_markup=main_menu_keyboard())
+            await query.edit_message_text(
+                f"{TRASH} File deleted!",
+                reply_markup=main_menu_keyboard()
+            )
         
         elif data == 'admin_panel':
             if is_admin(user.id):
-                await query.edit_message_text(f"{CROWN} <b>Admin Panel</b>\n\nSelect option:", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+                await query.edit_message_text(
+                    f"{CROWN} <b>Admin Panel</b>\n\nSelect option:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=admin_panel_keyboard()
+                )
             else:
                 await query.answer("Access Denied!", show_alert=True)
         
@@ -579,16 +811,33 @@ async def button_handler(update, context):
                 total_files = db.files['total']
                 total_banned = len(db.users['banned'])
                 total_premium = len(db.users['premium'])
-                stats = f"{CHART} <b>Bot Statistics</b>\n\n{PEOPLE} Users: <code>{total_users}</code>\n{PACKAGE} Files: <code>{total_files}</code>\n{WARNING} Banned: <code>{total_banned}</code>\n{STAR} Premium: <code>{total_premium}</code>\n{LOCK} Maintenance: {'ON' if db.admin['maintenance'] else 'OFF'}"
-                await query.edit_message_text(stats, parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+                stats = (
+                    f"{CHART} <b>Bot Statistics</b>\n\n"
+                    f"{PEOPLE} Users: <code>{total_users}</code>\n"
+                    f"{PACKAGE} Files: <code>{total_files}</code>\n"
+                    f"{WARNING} Banned: <code>{total_banned}</code>\n"
+                    f"{STAR} Premium: <code>{total_premium}</code>\n"
+                    f"{LOCK} Maintenance: {'ON' if db.admin['maintenance'] else 'OFF'}"
+                )
+                await query.edit_message_text(
+                    stats,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=admin_panel_keyboard()
+                )
         
         elif data == 'admin_users':
             if is_admin(user.id):
                 users_list = list(db.users['users'].items())[:10]
                 text = f"{PEOPLE} <b>Users ({len(db.users['users'])} total)</b>\n\n"
-                for uid, info in users_list:
-                    text += f"• <code>{uid}</code> - {info.get('name', 'N/A')}\n"
-                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{GLOBE} Back", callback_data='admin_panel')]]))
+                for uid_item, info in users_list:
+                    text += f"• <code>{uid_item}</code> - {info.get('name', 'N/A')}\n"
+                await query.edit_message_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(f"{GLOBE} Back", callback_data='admin_panel')
+                    ]])
+                )
         
         elif data == 'admin_bans':
             if is_admin(user.id):
@@ -597,9 +846,15 @@ async def button_handler(update, context):
                     text = f"{CHECK} No banned users!"
                 else:
                     text = f"{WARNING} <b>Banned Users</b>\n\n"
-                    for uid, info in list(banned.items())[:10]:
-                        text += f"• <code>{uid}</code> - {info.get('reason', 'N/A')}\n"
-                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{GLOBE} Back", callback_data='admin_panel')]]))
+                    for uid_item, info in list(banned.items())[:10]:
+                        text += f"• <code>{uid_item}</code> - {info.get('reason', 'N/A')}\n"
+                await query.edit_message_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(f"{GLOBE} Back", callback_data='admin_panel')
+                    ]])
+                )
         
         elif data == 'admin_premium':
             if is_admin(user.id):
@@ -608,9 +863,15 @@ async def button_handler(update, context):
                     text = f"{STAR} No premium users!"
                 else:
                     text = f"{STAR} <b>Premium Users</b>\n\n"
-                    for uid in list(premium.keys())[:10]:
-                        text += f"• <code>{uid}</code>\n"
-                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{GLOBE} Back", callback_data='admin_panel')]]))
+                    for uid_item in list(premium.keys())[:10]:
+                        text += f"• <code>{uid_item}</code>\n"
+                await query.edit_message_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(f"{GLOBE} Back", callback_data='admin_panel')
+                    ]])
+                )
         
         elif data == 'admin_cleanup':
             if is_admin(user.id):
@@ -623,21 +884,30 @@ async def button_handler(update, context):
                                 count += 1
                             except:
                                 pass
-                await query.edit_message_text(f"{TRASH} Cleaned {count} temporary files!", reply_markup=admin_panel_keyboard())
+                await query.edit_message_text(
+                    f"{TRASH} Cleaned {count} temporary files!",
+                    reply_markup=admin_panel_keyboard()
+                )
         
         elif data == 'admin_maintenance':
             if is_owner(user.id):
                 db.admin['maintenance'] = not db.admin['maintenance']
                 db.save_all()
                 status = "Enabled" if db.admin['maintenance'] else "Disabled"
-                await query.edit_message_text(f"{GEAR} Maintenance: {status}", reply_markup=admin_panel_keyboard())
+                await query.edit_message_text(
+                    f"{GEAR} Maintenance: {status}",
+                    reply_markup=admin_panel_keyboard()
+                )
             else:
                 await query.answer("Owner only!", show_alert=True)
     
     except Exception as e:
         logger.error(f"Button error: {e}")
         try:
-            await query.edit_message_text(f"{CROSS} Error. Use /start", reply_markup=main_menu_keyboard())
+            await query.edit_message_text(
+                f"{CROSS} Error. Use /start",
+                reply_markup=main_menu_keyboard()
+            )
         except:
             pass
 
@@ -647,7 +917,10 @@ async def button_handler(update, context):
 async def process_and_send(query, context, uid, file_uid):
     try:
         if file_uid not in db.files['files']:
-            await query.edit_message_text(f"{CROSS} File not found!", reply_markup=main_menu_keyboard())
+            await query.edit_message_text(
+                f"{CROSS} File not found!",
+                reply_markup=main_menu_keyboard()
+            )
             return
         
         file_info = db.files['files'][file_uid]
@@ -657,10 +930,14 @@ async def process_and_send(query, context, uid, file_uid):
         temp_path = os.path.join(TEMP_DIR, f"{uid}_{file_info['file_name']}")
         await tg_file.download_to_drive(temp_path)
         
-        new_name = file_info.get('rename_to') or user_rename.get(uid) or file_info['file_name']
+        new_name = (
+            file_info.get('rename_to') or 
+            user_rename.get(uid) or 
+            file_info['file_name']
+        )
+        
         thumb_path = user_thumbs.get(uid)
         thumb_file = None
-        
         if thumb_path and os.path.exists(thumb_path):
             thumb_file = open(thumb_path, 'rb')
         
@@ -678,7 +955,10 @@ async def process_and_send(query, context, uid, file_uid):
         if thumb_file:
             thumb_file.close()
         
-        await log_to_channel(context, uid, file_info['file_name'], new_name, file_info['file_size'], "processed")
+        await log_to_channel(
+            context, uid, file_info['file_name'],
+            new_name, file_info['file_size'], "processed"
+        )
         
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -687,41 +967,86 @@ async def process_and_send(query, context, uid, file_uid):
     
     except Exception as e:
         logger.error(f"Process error: {e}")
-        await query.edit_message_text(f"{CROSS} Error: {str(e)[:100]}", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(
+            f"{CROSS} Error: {str(e)[:100]}",
+            reply_markup=main_menu_keyboard()
+        )
+
+async def error_handler(update, context):
+    logger.error(f"Error: {context.error}")
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(f"{CROSS} An error occurred.")
+    except:
+        pass
+
+# ============================================
+# FLASK APP FOR BOT BUSINESS WEBHOOK
+# ============================================
+flask_app = Flask(__name__)
+telegram_app = None
+
+@flask_app.route('/')
+def home():
+    return "Bot is running!"
+
+@flask_app.route('/webhook', methods=['POST'])
+def webhook():
+    if telegram_app:
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        telegram_app.update_queue.put_nowait(update)
+    return 'OK'
 
 # ============================================
 # MAIN
 # ============================================
 def main():
+    global telegram_app
+    
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set!")
         return
     
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Build Telegram App
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
     
     # Error handler
-    app.add_error_handler(error_handler)
+    telegram_app.add_error_handler(error_handler)
     
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("ban", ban_cmd))
-    app.add_handler(CommandHandler("unban", unban_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("addpremium", addpremium_cmd))
-    app.add_handler(CommandHandler("rempremium", rempremium_cmd))
+    # Command handlers
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("help", help_cmd))
+    telegram_app.add_handler(CommandHandler("admin", admin_cmd))
+    telegram_app.add_handler(CommandHandler("stats", stats_cmd))
+    telegram_app.add_handler(CommandHandler("ban", ban_cmd))
+    telegram_app.add_handler(CommandHandler("unban", unban_cmd))
+    telegram_app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    telegram_app.add_handler(CommandHandler("addpremium", addpremium_cmd))
+    telegram_app.add_handler(CommandHandler("rempremium", rempremium_cmd))
     
-    # Handlers
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.AUDIO, handle_file))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Message handlers
+    telegram_app.add_handler(CallbackQueryHandler(button_handler))
+    telegram_app.add_handler(MessageHandler(
+        filters.Document.ALL | filters.VIDEO | filters.AUDIO,
+        handle_file
+    ))
+    telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("Bot started!")
-    print("Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # Initialize the app
+    telegram_app.initialize()
+    
+    # Set webhook
+    webhook_url = f"https://{os.environ.get('HOSTNAME', 'localhost')}/webhook"
+    try:
+        telegram_app.bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook set to: {webhook_url}")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+    
+    # Run Flask server
+    logger.info(f"Starting Flask server on port {PORT}")
+    flask_app.run(host='0.0.0.0', port=PORT)
 
 if __name__ == '__main__':
     main()
