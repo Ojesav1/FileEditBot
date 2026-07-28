@@ -2,33 +2,27 @@
   "name": "FileEditBot",
   "description": "File Rename & Thumbnail Bot",
   "repository": "https://github.com/Ojesav1/FileEditBot",
+  "bb_sync_version": "1.0",
   "env": {
     "BOT_TOKEN": {
       "description": "Telegram Bot Token",
-      "required": true
+      "required": true,
+      "value": "8908586560:AAGP_wxBUJ4yXSE8zggMzY6DKXlHxuSSLDo"
     },
     "OWNER_ID": {
       "description": "Owner Telegram ID",
-      "required": true
+      "required": true,
+      "value": "7266472182"
     },
     "ADMIN_IDS": {
       "description": "Admin IDs (comma separated)",
-      "required": true
+      "required": true,
+      "value": "7266472182"
     },
     "LOG_CHANNEL_ID": {
       "description": "Log Channel ID",
-      "required": true
-    }
-  },
-  "buildpacks": [
-    {
-      "url": "heroku/python"
-    }
-  ],
-  "formation": {
-    "worker": {
-      "quantity": 1,
-      "size": "eco"
+      "required": true,
+      "value": "-1004420447793"
     }
   }
 }
